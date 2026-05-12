@@ -1,0 +1,13 @@
+# Deny-by-default: ignore everything, then allow only the files we
+# explicitly track. Adding a new file requires updating the allowlist —
+# surfaces the decision instead of letting it slip in via `git add .`.
+#
+# README.private.md (plaintext) is intentionally NOT allowlisted —
+# only the encrypted README.private.md.gpg may be committed.
+
+*
+
+!.gitignore
+!README.md
+!README.private.md.gpg
+!init-from-bitwarden.sh
