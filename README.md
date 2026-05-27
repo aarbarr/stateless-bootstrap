@@ -20,7 +20,7 @@ cd ~/tmp/stateless-bootstrap
 ```bash
 brew update && brew install bitwarden-cli
 bw login
-export BW_SESSION="$(bw unlock --raw)"
+#export BW_SESSION="$(bw unlock --raw)"
 ./init-from-bitwarden.sh
 ```
 

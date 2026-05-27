@@ -36,13 +36,22 @@ while [[ $# -gt 0 ]]; do
     ;;
   --help | -h)
     cat <<EOF
-Usage: $(basename "$0") [--mode file|ssh-agent|gpg-import]
+Usage: $(basename "$0") [--mode file|ssh-agent|gpg-import|aws-vault-import]
 
 Materialize secrets from the Bitwarden 'stateless' folder onto this workstation.
-Each item must have a custom field 'mode' set to one of:
-  file        body=notes; requires fields 'path' + 'permissions'
-  ssh-agent   body=notes; staged to tmpfs and ssh-add'd
-  gpg-import  body=notes; piped into gpg --import
+Each item must have a custom field 'mode' set to one or more (comma-separated) of:
+  file               body=notes; requires fields 'path' + 'permissions'
+  ssh-agent          body=notes; staged to tmpfs and ssh-add'd
+  gpg-import         body=notes; piped into gpg --import
+  aws-vault-import   body=notes (aws_access_key_id=... / aws_secret_access_key=...);
+                     profile name is taken from the [profile.name] section header
+                     in the notes; pushed into aws-vault (pass backend)
+
+Multi-mode example: mode=file,aws-vault-import runs both handlers on the same item.
+Useful for AWS credentials that other tooling still expects at the on-disk path,
+while also wanting them available via aws-vault. Handlers run in the order listed
+in the mode field. The --mode filter, when set, runs only that one handler (other
+modes on matching items are skipped).
 EOF
     exit 0
     ;;
@@ -147,6 +156,74 @@ import_gpg() {
   echo "  ✓ set ultimate trust on $count primary key(s)"
 }
 
+import_aws_vault() {
+  local item="$1" name notes profile access_key_id secret_access_key
+
+  name=$(jq -r '.name' <<<"$item")
+  notes=$(jq -r '.notes // ""' <<<"$item")
+
+  # Extract the profile name from the first [section] header in the notes.
+  # The Bitwarden notes for AWS credentials items are already in canonical
+  # credentials-file format (one [profile.name] section + key=value lines)
+  # because the same notes also drive mode=file materialization. The
+  # section name IS the profile name — no separate Bitwarden field needed.
+  profile=$(awk '
+    /^\[[^]]+\]/ {
+      sub(/^\[/, ""); sub(/\].*$/, "")
+      print; exit
+    }
+  ' <<<"$notes")
+
+  if [[ -z "$profile" ]]; then
+    echo "  ✗ no [section] header in notes; profile name cannot be determined" >&2
+    return 1
+  fi
+
+  # Idempotency: skip if entry is already in pass. aws-vault `add` errors
+  # on existing profiles (no --update flag), so checking pass first avoids
+  # noisy failures on re-run. To rotate keys: `pass rm aws-vault/<profile>`
+  # then re-run.
+  if pass show "aws-vault/${profile}" >/dev/null 2>&1; then
+    echo "  • already in pass (aws-vault/${profile}), skipping"
+    return 0
+  fi
+
+  # Parse keys from notes. Accept either the canonical credentials-file
+  # format (with [section] header — same content as the old mode=file
+  # path uses) or a bare key=value format. Section headers are ignored;
+  # we take the first matching keys.
+  access_key_id=$(awk '
+    /^[[:space:]]*aws_access_key_id[[:space:]]*=/ {
+      sub(/^[[:space:]]*aws_access_key_id[[:space:]]*=[[:space:]]*/, "")
+      sub(/[[:space:]]+$/, "")
+      print; exit
+    }
+  ' <<<"$notes")
+  secret_access_key=$(awk '
+    /^[[:space:]]*aws_secret_access_key[[:space:]]*=/ {
+      sub(/^[[:space:]]*aws_secret_access_key[[:space:]]*=[[:space:]]*/, "")
+      sub(/[[:space:]]+$/, "")
+      print; exit
+    }
+  ' <<<"$notes")
+
+  if [[ -z "$access_key_id" || -z "$secret_access_key" ]]; then
+    echo "  ✗ aws_access_key_id and/or aws_secret_access_key not found in notes" >&2
+    return 1
+  fi
+
+  # Push to aws-vault non-interactively. Values flow via env vars only
+  # (read by aws-vault internally) — never argv. Stdin closed as
+  # belt-and-suspenders in case aws-vault decides to prompt despite the
+  # env vars being set.
+  AWS_ACCESS_KEY_ID="$access_key_id" \
+    AWS_SECRET_ACCESS_KEY="$secret_access_key" \
+    aws-vault add --env --no-add-config "$profile" </dev/null
+  unset access_key_id secret_access_key
+
+  echo "  ✓ added to aws-vault (pass: aws-vault/${profile})"
+}
+
 # ─── Main loop ────────────────────────────────────────────────────────────────
 
 echo "Materializing items from Bitwarden folder 'stateless'..."
@@ -155,26 +232,42 @@ while IFS= read -r item; do
   mode=$(field mode "$item")
   name=$(jq -r '.name' <<<"$item")
 
-  if [[ -n "$MODE_FILTER" && "$mode" != "$MODE_FILTER" ]]; then
-    continue
+  # Item-level filter: skip the item entirely if MODE_FILTER (when set) isn't
+  # in its comma-separated mode list. Tolerates whitespace around the commas.
+  if [[ -n "$MODE_FILTER" ]]; then
+    case ",${mode// /}," in
+    *",${MODE_FILTER},"*) ;;
+    *) continue ;;
+    esac
   fi
 
   echo
   echo "▸ $name  [mode=${mode:-?}]"
 
-  case "$mode" in
-  file) materialize_file "$item" ;;
-  ssh-agent) load_ssh "$item" ;;
-  gpg-import) import_gpg "$item" ;;
-  "")
+  if [[ -z "$mode" ]]; then
     echo "  ✗ no 'mode' field" >&2
     exit 1
-    ;;
-  *)
-    echo "  ✗ unknown mode '$mode'" >&2
-    exit 1
-    ;;
-  esac
+  fi
+
+  # Dispatch each comma-separated mode handler in order. Per-mode filter:
+  # when MODE_FILTER is set, only run that specific handler.
+  IFS=',' read -ra item_modes <<<"$mode"
+  for m in "${item_modes[@]}"; do
+    m="${m// /}"
+    if [[ -n "$MODE_FILTER" && "$m" != "$MODE_FILTER" ]]; then
+      continue
+    fi
+    case "$m" in
+    file) materialize_file "$item" ;;
+    ssh-agent) load_ssh "$item" ;;
+    gpg-import) import_gpg "$item" ;;
+    aws-vault-import) import_aws_vault "$item" ;;
+    *)
+      echo "  ✗ unknown mode '$m' in '$mode'" >&2
+      exit 1
+      ;;
+    esac
+  done
 done < <($BW_CMD list items --folderid "$FOLDER_ID" --session "$BW_SESSION" | jq -c '.[]')
 
 echo "Done."
