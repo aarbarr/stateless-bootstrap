@@ -64,7 +64,7 @@ done
 
 # ─── Resolve 'stateless' folder ID ────────────────────────────────────────────
 
-FOLDER_ID=$($BW_CMD list folders --session "$BW_SESSION" |
+FOLDER_ID=$(BW_SESSION="$BW_SESSION" $BW_CMD list folders |
   jq -r '.[] | select(.name=="stateless") | .id')
 
 [[ -n "$FOLDER_ID" ]] || {
@@ -268,6 +268,6 @@ while IFS= read -r item; do
       ;;
     esac
   done
-done < <($BW_CMD list items --folderid "$FOLDER_ID" --session "$BW_SESSION" | jq -c '.[]')
+done < <(BW_SESSION="$BW_SESSION" $BW_CMD list items --folderid "$FOLDER_ID" | jq -c '.[]')
 
 echo "Done."
