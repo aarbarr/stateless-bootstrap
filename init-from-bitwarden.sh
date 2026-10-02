@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Shred a staged SSH key on every exit path: normal end, set -e abort, Ctrl-C.
+# Without this, an interrupted or failed ssh-add left the key in /dev/shm.
+SSH_KEY_TMP=""
+cleanup_key() {
+  if [[ -n "$SSH_KEY_TMP" && -e "$SSH_KEY_TMP" ]]; then
+    shred -u "$SSH_KEY_TMP" 2>/dev/null || rm -f "$SSH_KEY_TMP"
+  fi
+  SSH_KEY_TMP=""
+}
+trap cleanup_key EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # ─── Bitwarden CLI detection ──────────────────────────────────────────────────
 
 if command -v bw >/dev/null 2>&1; then
@@ -113,16 +126,15 @@ load_ssh() {
   # only when given a path. Reading the key from stdin breaks the noecho
   # handling in some environments (observed in docker exec). Stage on
   # tmpfs (/dev/shm — RAM-only) and remove immediately after.
-  local key_path
-  key_path=$(mktemp /dev/shm/.ssh-key.XXXXXX) || {
+  SSH_KEY_TMP=$(mktemp /dev/shm/.ssh-key.XXXXXX) || {
     echo "  ✗ failed to create tempfile in /dev/shm" >&2
     return 1
   }
-  chmod 600 "$key_path"
-  printf '%b\n' "$notes" >"$key_path"
-  ssh-add "$key_path"
-  local rc=$?
-  shred -u "$key_path" 2>/dev/null || rm -f "$key_path"
+  chmod 600 "$SSH_KEY_TMP"
+  printf '%b\n' "$notes" >"$SSH_KEY_TMP"
+  local rc=0
+  ssh-add "$SSH_KEY_TMP" || rc=$?
+  cleanup_key
   [[ $rc -eq 0 ]] || return $rc
   echo "  ✓ loaded into ssh-agent"
 }
