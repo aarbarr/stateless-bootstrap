@@ -35,6 +35,8 @@ fi
 if [[ -z "${BW_SESSION:-}" ]]; then
   echo "BW_SESSION is not set." >&2
   echo "Run: export BW_SESSION=\"\$($BW_CMD unlock --raw)\"" >&2
+  echo "  (if unlock fails with 'decryption operation failed':" >&2
+  echo "   $BW_CMD logout; export BW_SESSION=\"\$($BW_CMD login --raw)\")" >&2
   exit 1
 fi
 

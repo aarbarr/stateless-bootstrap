@@ -21,6 +21,8 @@ cd ~/tmp/stateless-bootstrap
 brew update && brew install bitwarden-cli
 bw login
 export BW_SESSION="$(bw unlock --raw)"
+# 2026.9.1: unlock fails ("decryption operation failed") — instead:
+#   bw logout; export BW_SESSION="$(bw login --raw)"
 ./init-from-bitwarden.sh
 ```
 
