@@ -64,9 +64,13 @@ Each item must have a custom field 'mode' set to one or more (comma-separated) o
 
 Multi-mode example: mode=file,aws-vault-import runs both handlers on the same item.
 Useful for AWS credentials that other tooling still expects at the on-disk path,
-while also wanting them available via aws-vault. Handlers run in the order listed
-in the mode field. The --mode filter, when set, runs only that one handler (other
-modes on matching items are skipped).
+while also wanting them available via aws-vault. Handlers run by mode, in dependency
+order, regardless of item order in Bitwarden:
+  file -> gpg-import -> ssh-agent -> aws-vault-import
+(aws-vault's pass backend needs the GPG key imported first.) A failing item is
+reported and the run continues; the script exits non-zero if anything failed.
+The --mode filter, when set, runs only that one handler (other modes on
+matching items are skipped).
 EOF
     exit 0
     ;;
@@ -106,9 +110,9 @@ materialize_file() {
   fi
 
   path="${path/#\~/$HOME}"
-  mkdir -p "$(dirname "$path")"
-  printf '%b\n' "$notes" >"$path"
-  chmod "$perm" "$path"
+  mkdir -p "$(dirname "$path")" || return 1
+  printf '%b\n' "$notes" >"$path" || return 1
+  chmod "$perm" "$path" || return 1
   echo "  ✓ wrote $path ($perm)"
 }
 
@@ -132,10 +136,9 @@ load_ssh() {
     echo "  ✗ failed to create tempfile in /dev/shm" >&2
     return 1
   }
-  chmod 600 "$SSH_KEY_TMP"
-  printf '%b\n' "$notes" >"$SSH_KEY_TMP"
   local rc=0
-  ssh-add "$SSH_KEY_TMP" || rc=$?
+  { chmod 600 "$SSH_KEY_TMP" && printf '%b\n' "$notes" >"$SSH_KEY_TMP"; } || rc=$?
+  [[ $rc -eq 0 ]] && { ssh-add "$SSH_KEY_TMP" || rc=$?; }
   cleanup_key
   [[ $rc -eq 0 ]] || return $rc
   echo "  ✓ loaded into ssh-agent"
@@ -146,10 +149,10 @@ import_gpg() {
   name=$(jq -r '.name' <<<"$item")
   notes=$(jq -r '.notes // ""' <<<"$item")
 
-  mkdir -p "$HOME/.gnupg"
-  chmod 700 "$HOME/.gnupg"
+  mkdir -p "$HOME/.gnupg" || return 1
+  chmod 700 "$HOME/.gnupg" || return 1
 
-  printf '%b\n' "$notes" | gpg --batch --yes --import
+  printf '%b\n' "$notes" | gpg --batch --yes --import || return 1
   echo "  ✓ imported into gpg keyring"
 
   # Set ultimate ownertrust on every primary secret key in the keyring.
@@ -175,6 +178,20 @@ import_aws_vault() {
 
   name=$(jq -r '.name' <<<"$item")
   notes=$(jq -r '.notes // ""' <<<"$item")
+
+  # Check prerequisites up front. Without this, a missing `pass` made the
+  # idempotency check below read "command not found" as "not stored yet".
+  local cmd
+  for cmd in pass aws-vault; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "  ✗ '$cmd' not installed" >&2
+      return 1
+    fi
+  done
+  if [[ ! -f "${PASSWORD_STORE_DIR:-$HOME/.password-store}/.gpg-id" ]]; then
+    echo "  ✗ pass store not initialized. Run: pass init <gpg-key-fingerprint>" >&2
+    return 1
+  fi
 
   # Extract the profile name from the first [section] header in the notes.
   # The Bitwarden notes for AWS credentials items are already in canonical
@@ -232,7 +249,10 @@ import_aws_vault() {
   # env vars being set.
   AWS_ACCESS_KEY_ID="$access_key_id" \
     AWS_SECRET_ACCESS_KEY="$secret_access_key" \
-    aws-vault add --env --no-add-config "$profile" </dev/null
+    aws-vault add --env --no-add-config "$profile" </dev/null || {
+    unset access_key_id secret_access_key
+    return 1
+  }
   unset access_key_id secret_access_key
 
   echo "  ✓ added to aws-vault (pass: aws-vault/${profile})"
@@ -240,48 +260,69 @@ import_aws_vault() {
 
 # ─── Main loop ────────────────────────────────────────────────────────────────
 
+# Handlers run grouped by mode in dependency order, not in Bitwarden's item
+# order: aws-vault-import needs pass, which needs the GPG key from gpg-import.
+MODE_ORDER=(file gpg-import ssh-agent aws-vault-import)
+
+# Handler failures are collected rather than aborting, so one bad item doesn't
+# stop the rest. Note: set -e is suspended inside a function called with ||,
+# so each handler must return non-zero on its own failures.
+failed=()
+
 echo "Materializing items from Bitwarden folder 'stateless'..."
 
-while IFS= read -r item; do
+mapfile -t ITEMS < <(BW_SESSION="$BW_SESSION" $BW_CMD list items --folderid "$FOLDER_ID" | jq -c '.[]')
+
+# Validate every item's mode field before running anything.
+for item in "${ITEMS[@]}"; do
   mode=$(field mode "$item")
   name=$(jq -r '.name' <<<"$item")
-
-  # Item-level filter: skip the item entirely if MODE_FILTER (when set) isn't
-  # in its comma-separated mode list. Tolerates whitespace around the commas.
-  if [[ -n "$MODE_FILTER" ]]; then
-    case ",${mode// /}," in
-    *",${MODE_FILTER},"*) ;;
-    *) continue ;;
-    esac
-  fi
-
-  echo
-  echo "▸ $name  [mode=${mode:-?}]"
-
   if [[ -z "$mode" ]]; then
-    echo "  ✗ no 'mode' field" >&2
-    exit 1
+    echo "  ✗ $name: no 'mode' field" >&2
+    failed+=("$name [no mode]")
+    continue
   fi
-
-  # Dispatch each comma-separated mode handler in order. Per-mode filter:
-  # when MODE_FILTER is set, only run that specific handler.
   IFS=',' read -ra item_modes <<<"$mode"
   for m in "${item_modes[@]}"; do
     m="${m// /}"
-    if [[ -n "$MODE_FILTER" && "$m" != "$MODE_FILTER" ]]; then
-      continue
-    fi
-    case "$m" in
-    file) materialize_file "$item" ;;
-    ssh-agent) load_ssh "$item" ;;
-    gpg-import) import_gpg "$item" ;;
-    aws-vault-import) import_aws_vault "$item" ;;
+    case " ${MODE_ORDER[*]} " in
+    *" $m "*) ;;
     *)
-      echo "  ✗ unknown mode '$m' in '$mode'" >&2
-      exit 1
+      echo "  ✗ $name: unknown mode '$m' in '$mode'" >&2
+      failed+=("$name [unknown mode '$m']")
       ;;
     esac
   done
-done < <(BW_SESSION="$BW_SESSION" $BW_CMD list items --folderid "$FOLDER_ID" | jq -c '.[]')
+done
 
+for m in "${MODE_ORDER[@]}"; do
+  if [[ -n "$MODE_FILTER" && "$m" != "$MODE_FILTER" ]]; then
+    continue
+  fi
+  for item in "${ITEMS[@]}"; do
+    mode=$(field mode "$item")
+    # Match $m in the comma-separated mode list, tolerating whitespace.
+    case ",${mode// /}," in
+    *",$m,"*) ;;
+    *) continue ;;
+    esac
+    name=$(jq -r '.name' <<<"$item")
+
+    echo
+    echo "▸ $name  [$m]"
+    case "$m" in
+    file) materialize_file "$item" || failed+=("$name [$m]") ;;
+    gpg-import) import_gpg "$item" || failed+=("$name [$m]") ;;
+    ssh-agent) load_ssh "$item" || failed+=("$name [$m]") ;;
+    aws-vault-import) import_aws_vault "$item" || failed+=("$name [$m]") ;;
+    esac
+  done
+done
+
+echo
+if ((${#failed[@]})); then
+  echo "Done with ${#failed[@]} failure(s):" >&2
+  printf '  ✗ %s\n' "${failed[@]}" >&2
+  exit 1
+fi
 echo "Done."
