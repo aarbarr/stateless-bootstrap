@@ -10,12 +10,12 @@ you can decrypt the private README and continue.
 ### 1 — Clone this repo
 
 ```bash
-mkdir ~/tmp
+mkdir -p ~/tmp
 git clone https://github.com/aarbarr/stateless-bootstrap.git ~/tmp/stateless-bootstrap
 cd ~/tmp/stateless-bootstrap
 ```
 
-### 2 — Unlock Bitwarden
+### 2 — Install tools and run the Bitwarden import
 
 ```bash
 brew update && brew install bitwarden-cli pass aws-vault
@@ -27,7 +27,7 @@ export BW_SESSION="$(bw login --raw)"
 ### 3 — Decrypt the private runbook
 
 ```bash
-gpg -d README.private.md.gpg > README.private.md
+gpg README.private.md.gpg
 ```
 
 You'll be prompted for your GPG passphrase. The decrypted runbook
@@ -36,20 +36,21 @@ from here on out.
 
 ## Maintenance
 
-### 1 - Decrypting the private README
+### 1 — Decrypting the private README
 
 To edit the runbook, decrypt to a working file:
 
 ```bash
-gpg -d README.private.md.gpg > README.private.md
+gpg README.private.md.gpg
 ```
 
 The plaintext is `.gitignore`d so it can't be accidentally committed.
 
-### 2 - Encrypting the private README
+### 2 — Encrypting the private README
 
 After editing, encrypt to your primary GPG key and remove the plaintext:
 
 ```bash
 gpg --yes -e README.private.md
+rm README.private.md
 ```
