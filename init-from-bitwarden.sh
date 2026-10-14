@@ -40,6 +40,18 @@ if [[ -z "${BW_SESSION:-}" ]]; then
   exit 1
 fi
 
+# ─── Sync ─────────────────────────────────────────────────────────────────────
+# The CLI serves items from its local cache, which refreshes only on login or
+# sync. A fresh `bw login` already syncs; this covers a reused session, where an
+# edit made in the Bitwarden app or web vault would otherwise be materialized
+# stale. Stale secrets are worse than none, so a failed sync stops the run.
+
+echo "Syncing Bitwarden vault..." >&2
+BW_SESSION="$BW_SESSION" $BW_CMD sync >/dev/null || {
+  echo "bw sync failed; refusing to materialize from a possibly stale cache." >&2
+  exit 1
+}
+
 # ─── CLI args ─────────────────────────────────────────────────────────────────
 
 MODE_FILTER=""
